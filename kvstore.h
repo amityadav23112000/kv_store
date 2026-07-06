@@ -3,30 +3,50 @@
 
 #include <string>
 #include <unordered_map>
-#include <optional>       // for "value or nothing"
+#include <optional>
+#include <mutex>
+#include <functional>   // std::hash
 
 class KVStore {
 private:
-    std::unordered_map<std::string, std::string> data_;
-    // NOTE: not thread-safe yet — deliberately. M4 catches this red-handed.
+    static const size_t NUM_SHARDS = 8;   // a few x cores; power of 2
+
+ struct alignas(128) Shard {              // "every Shard starts at a 128-multiple address"
+    std::unordered_map<std::string, std::string> data;
+    mutable std::mutex shard_mutex;
+};
+
+    Shard shards[NUM_SHARDS];             // the 8 doors, side by side in memory
+
+    // Deterministic: same key -> same shard, every time, every thread.
+    Shard& pick_shard(const std::string& key) {
+        size_t hash_value = std::hash<std::string>{}(key);
+        return shards[hash_value % NUM_SHARDS];
+    }
+    const Shard& pick_shard(const std::string& key) const {
+        size_t hash_value = std::hash<std::string>{}(key);
+        return shards[hash_value % NUM_SHARDS];
+    }
 public:
-    // SET key value  → store (overwrite if exists)
     void set(const std::string& key, const std::string& value) {
-        data_[key] = value;
+        Shard& shard = pick_shard(key);                 // which door?
+        std::lock_guard<std::mutex> lock(shard.shard_mutex);
+        shard.data[key] = value;
     }
 
-    // GET key → the value, or "nothing" if key absent
     std::optional<std::string> get(const std::string& key) const {
-        auto it = data_.find(key);
-        if (it == data_.end()) return std::nullopt;   // not found
-        return it->second;                            // found: the value
+        const Shard& shard = pick_shard(key);
+        std::lock_guard<std::mutex> lock(shard.shard_mutex);
+        auto it = shard.data.find(key);
+        if (it == shard.data.end()) return std::nullopt;
+        return it->second;                              // copy out (M4 lesson)
     }
 
-    // DEL key → true if something was actually deleted
     bool del(const std::string& key) {
-        return data_.erase(key) > 0;    // erase returns how many it removed
+        Shard& shard = pick_shard(key);
+        std::lock_guard<std::mutex> lock(shard.shard_mutex);
+        return shard.data.erase(key) > 0;
     }
-
 
 };
 
